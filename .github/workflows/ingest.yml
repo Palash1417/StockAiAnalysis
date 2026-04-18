@@ -1,0 +1,66 @@
+name: Ingest Groww Corpus
+
+on:
+  schedule:
+    - cron: "30 3 * * *"   # 09:00 IST daily (03:30 UTC). GH Actions cron is UTC-only.
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Re-embed even if checksum unchanged"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ingest-groww
+  cancel-in-progress: false  # singleton — queue instead of overlap
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      TZ: Asia/Kolkata
+      RUN_ID: ingest_${{ github.run_id }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      VECTOR_DB_URL: ${{ secrets.VECTOR_DB_URL }}
+      S3_BUCKET: ${{ secrets.S3_BUCKET }}
+    defaults:
+      run:
+        working-directory: phase_4_scheduler_scraping
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: phase_4_scheduler_scraping/requirements.txt
+
+      - name: Install Python deps
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browsers
+        run: playwright install --with-deps chromium
+
+      - name: Run scraper + ingest
+        run: python -m scheduler.cli run --force=${{ inputs.force || 'false' }}
+
+      - name: Upload ScrapeReport
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scrape-report-${{ github.run_id }}
+          path: phase_4_scheduler_scraping/artifacts/scrape_report.json
+          retention-days: 90
+
+      - name: Notify on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: '{"text":":x: Ingest failed: run_id=${{ github.run_id }}"}'
+          webhook: ${{ secrets.SLACK_WEBHOOK }}
+          webhook-type: incoming-webhook

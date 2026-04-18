@@ -1,0 +1,26 @@
+- id: src_001
+  url: https://groww.in/mutual-funds/nippon-india-taiwan-equity-fund-direct-growth
+  type: scheme_page
+  scheme: "Nippon India Taiwan Equity Fund Direct - Growth"
+  category: international_equity
+  source_class: groww
+  fetched_at: null
+  checksum: null
+
+- id: src_002
+  url: https://groww.in/mutual-funds/bandhan-small-cap-fund-direct-growth
+  type: scheme_page
+  scheme: "Bandhan Small Cap Fund Direct - Growth"
+  category: small_cap
+  source_class: groww
+  fetched_at: null
+  checksum: null
+
+- id: src_003
+  url: https://groww.in/mutual-funds/hdfc-mid-cap-fund-direct-growth
+  type: scheme_page
+  scheme: "HDFC Mid Cap Fund Direct - Growth"
+  category: mid_cap
+  source_class: groww
+  fetched_at: null
+  checksum: null

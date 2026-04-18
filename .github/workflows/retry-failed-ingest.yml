@@ -1,0 +1,43 @@
+name: Retry Failed Ingest
+
+on:
+  workflow_run:
+    workflows: ["Ingest Groww Corpus"]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  retry:
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'failure'
+          && github.event.workflow_run.event == 'schedule' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute retry count
+        id: retries
+        run: |
+          n="${{ github.event.workflow_run.run_attempt }}"
+          echo "attempts=$n" >> "$GITHUB_OUTPUT"
+
+      - name: Stop after 2 retries
+        if: ${{ fromJSON(steps.retries.outputs.attempts) > 2 }}
+        run: |
+          echo "Already retried twice — giving up."
+          exit 0
+
+      - name: Sleep 15 minutes before retry
+        run: sleep 900
+
+      - name: Re-dispatch ingest workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            /repos/${{ github.repository }}/actions/workflows/ingest.yml/dispatches \
+            -f ref=main \
+            -f inputs[force]=false

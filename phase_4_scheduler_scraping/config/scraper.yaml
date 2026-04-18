@@ -1,0 +1,30 @@
+fetcher:
+  user_agent: "MutualFundFAQBot/1.0 (+contact: ops@example.com)"
+  nav_timeout_ms: 30000
+  wait_until: "networkidle"
+  anchor_selector_text: "Expense Ratio"
+
+politeness:
+  rate_limit_per_seconds: 3
+  jitter_max_seconds: 60
+  respect_robots_txt: true
+
+retry:
+  per_url_attempts: 3
+  backoff_seconds: [2, 8, 30]
+
+circuit_breaker:
+  abort_if_failed_fraction_exceeds: 0.5
+
+drift:
+  required_field_extraction_threshold: 0.7
+
+required_fields:
+  - scheme
+  - expense_ratio
+  - exit_load
+
+persistence:
+  raw_html_dir: "corpus/{run_id}"
+  structured_json_dir: "corpus/{run_id}"
+  report_path: "artifacts/scrape_report.json"

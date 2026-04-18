@@ -1,0 +1,7 @@
+pyyaml>=6.0.1
+pytest>=8.0.0
+
+# Optional — only needed when swapping the fake embedder for real providers:
+# openai>=1.30.0
+# sentence-transformers>=2.7.0
+# tiktoken>=0.7.0
