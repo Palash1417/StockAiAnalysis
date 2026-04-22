@@ -1,0 +1,27 @@
+# Render Blueprint — defines the backend Web Service.
+# Import this repo in the Render dashboard; it will auto-configure the service.
+# Docs: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: mf-faq-api
+    runtime: python
+    plan: starter          # free | starter ($7) | standard ($25)
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn phase_9_api.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: CHROMA_API_KEY
+        sync: false        # set manually in Render dashboard
+      - key: CHROMA_TENANT
+        sync: false
+      - key: CHROMA_DATABASE
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false        # set to your Vercel URL after deploying frontend
+      - key: ENVIRONMENT
+        value: production
+      - key: LOG_LEVEL
+        value: INFO

@@ -56,9 +56,17 @@ def create_app(config: dict[str, Any] | None = None) -> FastAPI:
     )
 
     # --- Middleware ---
+    # Merge static config origins with CORS_ORIGINS env var (set on Render
+    # to the Vercel deployment URL, e.g. https://xxx.vercel.app)
+    env_origins = [
+        o.strip()
+        for o in os.environ.get("CORS_ORIGINS", "").split(",")
+        if o.strip()
+    ]
+    origins = config.get("cors", {}).get("origins", []) + env_origins
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=config.get("cors", {}).get("origins", ["*"]),
+        allow_origins=origins or ["*"],
         allow_methods=["*"],
         allow_headers=["*"],
     )
