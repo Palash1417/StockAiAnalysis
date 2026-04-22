@@ -1,4 +1,7 @@
 Problem Statement: Mutual Fund FAQ Assistant (Facts-Only Q&A)
+
+> Status note (2026-04-19): this is the original problem statement. The ingestion half of the system (phases 4.0 + 4.1) is implemented under `phase_4_scheduler_scraping/` and `phase_4_1_chunk_embed_index/`. The retrieval/generation/guardrails/UI deliverables listed below remain design-only — see `architecture.md` §15 roadmap and §17 implementation map.
+
 Overview
 The objective of this project is to build a facts-only FAQ assistant for mutual fund schemes, using Groww as the reference product context. The assistant will answer objective, verifiable queries related to mutual funds by retrieving information exclusively from official public sources, such as AMC (Asset Management Company) websites, AMFI, and SEBI.
 The system must strictly avoid providing investment advice, opinions, or recommendations. Every response must include a single, clear source link and adhere to defined constraints around clarity, accuracy, and compliance.
@@ -21,6 +24,8 @@ SID (Scheme Information Document)
 AMC FAQ/help pages
 AMFI/SEBI guidance pages
 Statement and tax document download guides
+
+Status: current corpus is 3 Groww scheme pages across three categories (International Equity, Small-Cap, Mid-Cap) registered in `phase_4_scheduler_scraping/config/sources.yaml`. No PDFs ingested yet. Groww is used as an interim ground truth until official AMC/AMFI/SEBI pages are added.
 2. FAQ Assistant Requirements
 The assistant must:
 Answer facts-only queries, such as:
@@ -83,3 +88,18 @@ Strict adherence to facts-only responses
 Consistent inclusion of valid source citations
 Proper refusal of advisory queries
 Clean, minimal, and user-friendly interface
+
+Deliverable status (2026-04-19)
+
+Implemented
+- Architecture overview: `doc/architecture.md` with code cross-references.
+- Scheduler + scraping: `.github/workflows/ingest.yml`, `.github/workflows/retry-failed-ingest.yml`, `phase_4_scheduler_scraping/` (README, config, service, tests).
+- Chunk/embed/index/snapshot pipeline: `phase_4_1_chunk_embed_index/` (README, pipeline, in-memory stores, 29 tests).
+- Known limitations: `architecture.md` §14.
+
+Not yet implemented
+- Retrieval + reranker (§6), generation (§7), guardrails (§8).
+- FastAPI + multi-thread session store + in-flight locks.
+- Frontend (welcome banner, 3 example chips, sticky disclaimer, thread sidebar).
+- Golden-set evaluation harness + CI accuracy gate.
+- Real pgvector (wired in phase 4.2 with `bge-small-en-v1.5` 384-dim embedder) and S3/MinIO storage adapter (also wired in phase 4.2).

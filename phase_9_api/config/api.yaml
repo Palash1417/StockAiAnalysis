@@ -1,0 +1,59 @@
+# Phase 9 — API configuration
+
+server:
+  host: 0.0.0.0
+  port: 8000
+
+cors:
+  origins:
+    - "http://localhost:3000"   # Next.js dev server (default)
+    - "http://localhost:3001"   # Next.js dev server (fallback when 3000 is taken)
+    - "http://localhost:8000"
+
+rate_limit:
+  max_requests: 20
+  window_seconds: 60
+
+session_store:
+  backend: sqlite              # sqlite | redis
+  sqlite:
+    path: data/sessions.db
+    ttl_hours: 24
+  redis:
+    url: ${REDIS_URL:redis://localhost:6379}
+    ttl_seconds: 86400
+
+embedder:
+  provider: bge_local
+  model: BAAI/bge-small-en-v1.5
+  dim: 384
+
+retriever:
+  backend: chroma              # in_memory | chroma | pgvector
+  top_k_dense: 20
+  top_k_sparse: 20
+  top_k_rrf: 15
+  top_n_rerank: 5
+  score_threshold: 0.01  # RRF scores (passthrough reranker) peak at ~0.016–0.033; 0.35 was for cross-encoder
+
+reranker:
+  type: passthrough            # passthrough | cross_encoder
+
+query_rewrite:
+  use_llm: false               # true → Groq call; false → rule-based
+  model: llama-3.3-70b-versatile
+
+generation:
+  model: llama-3.3-70b-versatile
+  temperature: 0.1
+  max_tokens: 512
+
+guardrails:
+  intent:
+    use_llm: false
+  groundedness:
+    enabled: false
+
+chroma:                        # used when retriever.backend: chroma
+  collection: mf_rag
+  # api_key, tenant, database read from env: CHROMA_API_KEY, CHROMA_TENANT, CHROMA_DATABASE

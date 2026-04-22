@@ -1,7 +1,7 @@
 """Embedder — §5.6 + §5.7.
 
-Primary: OpenAI text-embedding-3-large (3072 dim).
-Fallback: BAAI/bge-large-en-v1.5 (1024 dim) via sentence-transformers.
+Primary: BAAI/bge-small-en-v1.5 (384 dim) via sentence-transformers.
+Fallback: OpenAI text-embedding-3-large (3072 dim) — set provider=openai in config.
 Deterministic fake: for tests, avoids any external call.
 
 Batching, retry/backoff, and hard cap live in `CachedEmbedder`, which wraps
@@ -177,8 +177,8 @@ def build_embedder(config: dict) -> EmbedderProtocol:
         )
     if provider == "bge_local":
         return _BGELocalEmbedder(
-            model=config.get("model", "BAAI/bge-large-en-v1.5"),
-            dim=config.get("dim", 1024),
+            model=config.get("model", "BAAI/bge-small-en-v1.5"),
+            dim=config.get("dim", 384),
         )
     raise ValueError(f"unknown embedder provider: {provider}")
 
@@ -209,6 +209,8 @@ class _BGELocalEmbedder:
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
         if self._model is None:
             from sentence_transformers import SentenceTransformer  # type: ignore
-            self._model = SentenceTransformer(self._model_name)
+            # backend="torch" avoids ONNX Runtime memory-mapping which fails on
+            # Windows systems with small paging files (os error 1455).
+            self._model = SentenceTransformer(self._model_name, backend="torch")
         vectors = self._model.encode(texts, normalize_embeddings=True)
-        return [list(v) for v in vectors]
+        return [v.tolist() for v in vectors]

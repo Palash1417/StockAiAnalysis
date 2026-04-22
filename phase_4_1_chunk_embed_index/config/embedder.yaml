@@ -1,7 +1,7 @@
 embedder:
-  provider: openai          # openai | bge_local | fake
-  model: text-embedding-3-large
-  dim: 3072
+  provider: bge_local        # bge_local | openai | fake
+  model: BAAI/bge-small-en-v1.5
+  dim: 384
   batch_size: 64
   normalize: true
   hard_cap_per_run: 1000

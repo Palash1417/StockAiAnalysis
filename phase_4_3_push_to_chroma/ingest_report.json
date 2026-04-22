@@ -1,0 +1,35 @@
+{
+  "run_id": "phase43_1776888871",
+  "corpus_version": "corpus_v_phase43_1776888871",
+  "started_at": "2026-04-22T20:14:31.025813+00:00",
+  "finished_at": "2026-04-22T20:16:23.762179+00:00",
+  "status": "ok",
+  "embed_model": "bge_local/BAAI/bge-small-en-v1.5@v1",
+  "sources_ok": 3,
+  "sources_total": 3,
+  "chunks_pushed": 136,
+  "chroma_total": 136,
+  "sources": [
+    {
+      "source_id": "src_001",
+      "status": "ok",
+      "facts_extracted": 9,
+      "chunks": 25,
+      "duration_s": 84.5
+    },
+    {
+      "source_id": "src_002",
+      "status": "ok",
+      "facts_extracted": 10,
+      "chunks": 72,
+      "duration_s": 11.4
+    },
+    {
+      "source_id": "src_003",
+      "status": "ok",
+      "facts_extracted": 10,
+      "chunks": 39,
+      "duration_s": 9.0
+    }
+  ]
+}

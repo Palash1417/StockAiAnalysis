@@ -1,0 +1,6 @@
+# Phase 7 — Generation dependencies
+groq>=0.9.0          # Groq Python SDK (OpenAI-compatible interface)
+pyyaml>=6.0
+
+# Testing
+pytest>=8.0

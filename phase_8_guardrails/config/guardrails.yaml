@@ -1,0 +1,28 @@
+# Phase 8 — Guardrails configuration
+
+# --- Input guards ---
+
+pii:
+  enabled: true                   # PII detection always on
+
+injection:
+  enabled: true                   # Prompt-injection filter always on
+
+intent:
+  enabled: true
+  use_llm: false                  # true → Groq single call; false → rule-based only
+  model: llama-3.3-70b-versatile
+
+# --- Output guards ---
+
+length:
+  enabled: true
+  max_sentences: 3                # §7.1 hard limit
+
+advice:
+  enabled: true                   # Advice detector always on
+
+groundedness:
+  enabled: false                  # LLM-as-judge; disable by default (latency cost)
+  model: llama-3.3-70b-versatile
+  threshold: 0.7                  # Score below this → not grounded

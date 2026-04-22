@@ -1,66 +1,83 @@
 name: Ingest Groww Corpus
 
+# Trigger: 09:15 IST daily (UTC = IST - 5h30m → 03:45 UTC).
+# GitHub Actions cron is UTC-only; scheduled runs may be delayed ≤15 min under load.
 on:
   schedule:
-    - cron: "30 3 * * *"   # 09:00 IST daily (03:30 UTC). GH Actions cron is UTC-only.
+    - cron: "45 3 * * *"   # 09:15 IST daily
   workflow_dispatch:
     inputs:
       force:
-        description: "Re-embed even if checksum unchanged"
+        description: "Re-scrape and re-embed even if page content is unchanged"
         type: boolean
         default: false
 
 concurrency:
   group: ingest-groww
-  cancel-in-progress: false  # singleton — queue instead of overlap
+  cancel-in-progress: false  # singleton — queue, never overlap
 
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
-      contents: write
-      id-token: write
+      contents: read
+
     env:
       TZ: Asia/Kolkata
-      RUN_ID: ingest_${{ github.run_id }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      VECTOR_DB_URL: ${{ secrets.VECTOR_DB_URL }}
-      S3_BUCKET: ${{ secrets.S3_BUCKET }}
-    defaults:
-      run:
-        working-directory: phase_4_scheduler_scraping
-    steps:
-      - uses: actions/checkout@v4
+      GROQ_API_KEY:      ${{ secrets.GROQ_API_KEY }}
+      CHROMA_API_KEY:    ${{ secrets.CHROMA_API_KEY }}
+      CHROMA_TENANT:     ${{ secrets.CHROMA_TENANT }}
+      CHROMA_DATABASE:   ${{ secrets.CHROMA_DATABASE }}
+      SLACK_WEBHOOK:     ${{ secrets.SLACK_WEBHOOK }}
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: phase_4_scheduler_scraping/requirements.txt
+          cache-dependency-path: phase_4_3_push_to_chroma/requirements.txt
 
-      - name: Install Python deps
-        run: pip install -r requirements.txt
+      # Cache the bge-small-en-v1.5 model (~130 MB) so it isn't re-downloaded
+      # on every run. Key is pinned to the model revision — bump to invalidate.
+      - name: Cache HuggingFace model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-bge-small-en-v1.5-v1
 
-      - name: Install Playwright browsers
-        run: playwright install --with-deps chromium
+      - name: Install Python dependencies
+        run: pip install -r phase_4_3_push_to_chroma/requirements.txt
 
-      - name: Run scraper + ingest
-        run: python -m scheduler.cli run --force=${{ inputs.force || 'false' }}
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
 
-      - name: Upload ScrapeReport
+      # -----------------------------------------------------------------------
+      # Main pipeline: Scrape → Chunk → Embed → Push to Chroma Cloud
+      # -----------------------------------------------------------------------
+      - name: Scrape → Chunk → Embed → Push to Chroma
+        run: python phase_4_3_push_to_chroma/run.py
+
+      # -----------------------------------------------------------------------
+      # Upload the ingest report as a workflow artifact (retained 90 days)
+      # -----------------------------------------------------------------------
+      - name: Upload ingest report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scrape-report-${{ github.run_id }}
-          path: phase_4_scheduler_scraping/artifacts/scrape_report.json
+          name: ingest-report-${{ github.run_id }}
+          path: phase_4_3_push_to_chroma/ingest_report.json
           retention-days: 90
+          if-no-files-found: ignore
 
       - name: Notify on failure
         if: failure()
         uses: slackapi/slack-github-action@v1.26.0
         with:
-          payload: '{"text":":x: Ingest failed: run_id=${{ github.run_id }}"}'
+          payload: '{"text":":x: Groww ingest failed: run=${{ github.run_id }} branch=${{ github.ref_name }}"}'
           webhook: ${{ secrets.SLACK_WEBHOOK }}
           webhook-type: incoming-webhook

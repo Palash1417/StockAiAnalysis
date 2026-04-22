@@ -2,6 +2,8 @@
 
 Primary reference for future sessions in `RAG-ChatBOT`. Source-of-truth docs live in `doc/doc.md` (problem statement) and `doc/architecture.md` (detailed architecture). This file is the condensed working brief.
 
+**Implementation status:** Phases 4.0 (scheduler + scraping), 4.1 (chunk/embed/index/snapshot), 4.2 (prod wiring: pgvector + Postgres FTS + S3/MinIO adapters), **5** (ingestion CLI — wires 4.1 + 4.2, hard-purge cron), and **6** (hybrid retrieval — dense + BM25 + RRF + rerank + query rewrite) are coded and tested. Generation (§7), guardrails (§8), session store, and UI are **not yet implemented** — they remain design-only in `doc/architecture.md`.
+
 ---
 
 ## 1. What we are building
@@ -64,39 +66,48 @@ UI (Next.js) → FastAPI (thread mgr, session, rate limit)
 
 ---
 
-## 5. Scheduler — GitHub Actions (committed choice)
+## 5. Scheduler — GitHub Actions (implemented)
+
+Code: `.github/workflows/ingest.yml`, `.github/workflows/retry-failed-ingest.yml`.
 
 - **Workflow:** `.github/workflows/ingest.yml`.
-- **Cron:** `30 3 * * *` UTC = **09:00 IST daily** (GitHub Actions is UTC-only).
-- **Manual trigger:** `workflow_dispatch` with `force` bool input; internal `POST /admin/ingest/run` dispatches via GitHub REST.
+- **Cron:** `45 3 * * *` UTC = **09:15 IST daily** (GitHub Actions is UTC-only; IST = UTC+5:30).
+- **Pipeline:** runs `python phase_4_3_push_to_chroma/run.py` — single script that scrapes all 3 Groww URLs, chunks, embeds (BAAI/bge-small-en-v1.5 via PyTorch), and upserts vectors to Chroma Cloud. No Postgres required.
+- **Manual trigger:** `workflow_dispatch` with `force` bool input (re-scrapes even if content unchanged).
 - **Singleton:** `concurrency: { group: ingest-groww, cancel-in-progress: false }` — queues, never overlaps.
-- **Timeout:** `timeout-minutes: 20`.
-- **Retry:** no native retry on scheduled runs → companion `retry-failed-ingest.yml` listens on `workflow_run: failure`, re-dispatches up to 2× with 15 min delay.
-- **Secrets:** `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `VECTOR_DB_URL`, `S3_BUCKET`, `SLACK_WEBHOOK` — via GitHub encrypted secrets.
-- **State:** runners are ephemeral → all persisted state (vector index, raw HTML) lives in S3/MinIO + external vector DB; never on the runner FS.
-- **Observability:** ScrapeReport uploaded as artifact (90-day retention); metrics via OTLP; Slack alert on failure.
-- **Delay caveat:** GitHub may delay scheduled runs up to 15 min under peak load → valid window is 09:00–09:20 IST.
+- **Timeout:** `timeout-minutes: 30`.
+- **Retry:** companion `retry-failed-ingest.yml` listens on `workflow_run: failure` + `schedule` event, re-dispatches up to 2× with 15 min delay (`sleep 900`).
+- **Secrets required (GitHub encrypted secrets):** `GROQ_API_KEY`, `CHROMA_API_KEY`, `CHROMA_TENANT` (UUID from Chroma Cloud dashboard), `CHROMA_DATABASE`, `SLACK_WEBHOOK`.
+- **Model cache:** HuggingFace cache (`~/.cache/huggingface`) persisted between runs via `actions/cache` (key: `hf-bge-small-en-v1.5-v1`) — avoids 130 MB re-download on every run.
+- **State:** Chroma Cloud holds all vector state; runner FS is ephemeral. `ingest_report.json` uploaded as artifact (90-day retention).
+- **Observability:** ingest report artifact per run; Slack alert on failure. OTLP metrics export is design-only (not wired).
+- **Delay caveat:** GitHub may delay scheduled runs up to 15 min → valid window is 09:15–09:30 IST.
 
 ---
 
-## 6. Scraping Service
+## 6. Scraping Service (implemented)
 
-Runs as a step inside the `ingest` GitHub Actions job.
+Code: `phase_4_scheduler_scraping/scraping_service/`. Runs as a step inside the `ingest` GitHub Actions job.
 
-- **Fetch:** Playwright (headless Chromium) with `wait_until="networkidle"` + selector wait before `page.content()`; `httpx` fallback on timeout.
-- **Politeness:** 1 req / 3 s token bucket, 0–60 s jitter, honor robots.txt, UA = `MutualFundFAQBot/1.0 (+contact: ops@example.com)`.
-- **Per-URL retry:** 3× exponential backoff (2 s, 8 s, 30 s).
-- **Circuit breaker:** abort run if > 50 % of URLs fail; keep previous snapshot live.
-- **Selector-drift alert:** fires if < 70 % of required fields extracted.
-- **Checksum diff:** SHA-256 on raw HTML → unchanged sources skip downstream work.
-- **Validation:** required fields (scheme name, expense ratio, exit load) — missing → `degraded`, alert, keep previous snapshot.
-- **Persist:** raw HTML to `corpus/<run_id>/<source_id>.html`, structured JSON to `corpus/<run_id>/<source_id>.json`.
-- **Output:** `ScrapeReport` with per-URL `changed | unchanged | degraded | failed` status.
-- **Emits:** `DocumentChangedEvent` to the chunk/embed pipeline **only for changed sources**.
+- **Entrypoint:** `ScrapingService.run(run_id, source_ids=None, force=False) → ScrapeReport` in `service.py`.
+- **Fetch:** `fetcher/fetcher.py` — `Fetcher` class uses Playwright (headless Chromium, `wait_until="networkidle"`, anchor selector `Expense Ratio`, 30 s nav timeout) with `httpx` fallback on timeout; `RobotsCache` (24 h per-host TTL) raises `FetchError` on disallow.
+- **Politeness:** `rate_limit.py` — `TokenBucketRateLimiter` 1 req / 3 s + uniform 0–60 s jitter, UA = `MutualFundFAQBot/1.0 (+contact: ops@example.com)`.
+- **Parser:** `parser/groww_parser.py` — `GrowwSchemePageParser` extracts 10 fact labels (expense_ratio, exit_load, min_sip, min_lumpsum, lock_in, risk, benchmark, fund_manager, aum, launch_date) plus narrative sections (h1–h3) and HTML tables (caption, headers, rows).
+- **Per-URL retry:** 3× exponential backoff (2 s, 8 s, 30 s) — `_fetch_with_retry`.
+- **Circuit breaker:** `CircuitBreakerOpen` raised if > 50 % of URLs fail; keep previous snapshot live.
+- **Selector-drift alert:** logs error if avg `extraction_ratio` < 0.7 across tracked fields.
+- **Checksum diff:** SHA-256 on raw HTML → unchanged sources skip downstream work (unless `force=True`).
+- **Validation:** `validator/validator.py` — required fields (scheme, expense_ratio, exit_load) missing → `degraded`, HTML persisted but JSON not persisted, no event emitted.
+- **Persist:** `persistence/storage.py` — `LocalStorage` writes raw HTML to `corpus/<run_id>/<source_id>.html`, structured JSON to `corpus/<run_id>/<source_id>.json`, report to `artifacts/scrape_report.json`. Prod swap-in: S3/MinIO adapter (not yet coded).
+- **Output:** `ScrapeReport` (run_id, started_at, finished_at, results, summary) with per-URL `changed | unchanged | degraded | failed` status.
+- **Emits:** `DocumentChangedEvent` (run_id, source_id, source_url, scheme, structured_json_path, html_path, checksum, emitted_at) to the chunk/embed pipeline **only for changed sources**.
+- **CLI exit codes:** 0 clean, 1 any source failed, 2 `CircuitBreakerOpen`.
 
 ---
 
-## 7. Chunking & Embedding
+## 7. Chunking & Embedding (implemented)
+
+Code: `phase_4_1_chunk_embed_index/ingestion_pipeline/`. Orchestrator: `IngestionPipeline.handle(doc, run_id) → IngestionResult` in `pipeline.py`. Entrypoint: `python cli.py ingest --json … --source-id … --scheme … --source-url … --last-updated … --run-id …`.
 
 ### Segmenter → 3 segment types
 - `fact_table` — key-value pairs (expense ratio, exit load, min SIP, …). Atomic.
@@ -118,31 +129,45 @@ chunk_hash = sha256(f"{embed_model_id}:{normalized_text}")
 `embed_model_id` is part of the hash → model upgrade automatically invalidates cache. Postgres table `embedding_cache(chunk_hash PK, embedding BYTEA, dim INT, created_at)`. Steady-state cache hit target > 90 %.
 
 ### Embedder
-- **Primary:** OpenAI `text-embedding-3-large` (3072 dim).
-- **Local fallback:** `BAAI/bge-large-en-v1.5` (1024 dim) via `sentence-transformers`.
-- **Config-driven** (`embedder.provider`, `.model`, `.dim`, `.batch_size`, `.normalize`).
-- **Batch size 64**, retry with 1/3/9/27 s backoff on 429/5xx, hard cap 1,000 chunks/run.
-- `embed_model_id = "openai/text-embedding-3-large@2024-01"` stored per row.
+- **Factory:** `embedder/build_embedder.py` — `build_embedder(config)` dispatches on `provider` ∈ {`fake`, `openai`, `bge_local`}.
+- **Primary:** `BAAI/bge-small-en-v1.5` (384 dim) via `sentence-transformers` — runs locally, no API key needed.
+- **Optional alternative:** OpenAI `text-embedding-3-large` (3072 dim) — set `provider: openai` in config.
+- **Test/dev default:** `FakeDeterministicEmbedder` (64 dim, model_id `fake/deterministic@v1`) — SHA-based deterministic vectors, L2-normalized, no network.
+- **Config:** `config/embedder.yaml` — `provider`, `model`, `dim`, `batch_size=64`, `normalize=true`, `hard_cap_per_run=1000`, `retry_backoff_seconds=[1,3,9,27]`, `max_attempts=5`.
+- **`CachedEmbedder` wrapper:** queries cache → batches misses (64) → `_embed_with_retry` with exponential backoff → updates cache → exposes `cache_hits`, `api_embeds` counters. Raises `RuntimeError` if attempts exhausted.
+- `embed_model_id = "bge_local/BAAI/bge-small-en-v1.5@v1"` stored per row.
 
 ### Index writer — three stores
-| Store      | Purpose                          | Key                         |
-|------------|----------------------------------|-----------------------------|
-| Vector DB  | Dense retrieval (cosine)         | `chunk_id`                  |
-| BM25       | Sparse retrieval                 | `chunk_id`                  |
-| Fact KV    | Exact-lookup fast path           | `(scheme_id, field_name)`   |
+| Store      | Purpose                          | Key                         | Impl (current)                |
+|------------|----------------------------------|-----------------------------|-------------------------------|
+| Vector DB  | Dense retrieval (cosine)         | `chunk_id`                  | `InMemoryVectorIndex` (Protocol: `VectorIndex`) |
+| BM25       | Sparse retrieval                 | `chunk_id`                  | `InMemoryBM25` (regex tokenizer `[a-z0-9]+`) |
+| Fact KV    | Exact-lookup fast path           | `(scheme_id, field_name)`   | `InMemoryFactKV`              |
 
-pgvector schema: `chunks(chunk_id PK, source_id, scheme, section, segment_type, text, embedding vector(3072), embed_model_id, chunk_hash, source_url, last_updated, corpus_version)` with HNSW cosine index + `(scheme, segment_type)` btree. Upsert on `chunk_id`. Soft-delete missing chunks; hard-purge after 7 days.
+`IndexWriter.upsert(embedded, corpus_version, source_id, source_url, last_updated) → UpsertReport`:
+1. Validates no duplicate `chunk_id` within the call (raises otherwise).
+2. Writes vector rows with full metadata (chunk_id, source_id, scheme, section, segment_type, text, embedding, embed_model_id, chunk_hash, source_url, last_updated, corpus_version, dim).
+3. Upserts BM25 with (text, metadata).
+4. For `fact_table` segments, writes FactKV with `field_name`, `raw_value`, `source_url`, `last_updated`.
+5. Soft-deletes orphans (chunks in this `(corpus_version, source_id)` not present in current batch); deletes from BM25.
+6. Returns `UpsertReport(corpus_version, chunks_upserted, chunks_soft_deleted, fact_kv_writes, bm25_writes)`.
+
+**Prod target (wired in phase 4.2):** pgvector schema `chunks(... embedding vector(384) ...)` with HNSW cosine index. Dim matches `bge-small-en-v1.5`; change to 3072 for OpenAI. Hard-purge soft-deleted rows after 7 days.
 
 ### Snapshot & atomic swap (shadow-rebuild)
-1. Writes tagged with new `corpus_version = corpus_v<run_id>`.
-2. Smoke test: 10 canned queries must pass groundedness + citation validity.
-3. On success: `UPDATE corpus_pointer SET live = <new>` (single row flip).
+
+Code: `snapshot/` — `SnapshotManager`, `SmokeQuery`, `CorpusPointer` Protocol, `InMemoryCorpusPointer`.
+
+1. Writes tagged with new `corpus_version = corpus_v_<run_id>`.
+2. `SnapshotManager.try_swap(version)` calls `smoke_runner(version, smoke_queries) → pass_rate`. `pass_rate < 1.0` raises `SmokeTestFailed`.
+3. On success: `pointer.set_live(version)` (single-row flip).
 4. On failure: new version left dangling, retriever keeps serving previous, Slack alert.
-5. Keep last 7 versions; GC older. Same mechanism handles embedding-model upgrades.
+5. `_gc_old_versions()` keeps last `keep_versions=7`; calls optional `gc(to_drop)` hook. Same mechanism handles embedding-model upgrades.
+6. Current smoke runner used by `cli.py` is a no-op stub (always passes) — real groundedness/citation checks land with §6–§8.
 
 ---
 
-## 8. Retrieval & Generation
+## 8. Retrieval & Generation (design-only — not yet implemented)
 
 ### Retrieval
 - **Hybrid**: dense (cosine, top-K=20) + BM25 (top-K=20) → RRF (k=60) → top-K=15 → cross-encoder rerank (`bge-reranker-base` or Cohere Rerank v3) → top-N=5.
@@ -152,7 +177,7 @@ pgvector schema: `chunks(chunk_id PK, source_id, scheme, section, segment_type, 
 - **Source-class priority** (current): fact-table chunk > narrative chunk, tie-break on most recent `last_updated`. Future: AMC factsheet > SID > KIM > AMFI > SEBI > Groww.
 
 ### Generation
-- **LLM:** Claude Sonnet 4.6 (primary), Claude Opus 4.7 for complex tables. Temperature 0.0–0.2.
+- **LLM:** Groq `llama-3.3-70b-versatile` (primary). Temperature 0.0–0.2.
 - **Prompt contract:** answer only from provided context; max 3 sentences; exactly one citation; append `Last updated from sources: <date>`; return `INSUFFICIENT_CONTEXT` sentinel when chunks don't cover the question.
 - **Output JSON schema:**
   ```json
@@ -167,7 +192,7 @@ pgvector schema: `chunks(chunk_id PK, source_id, scheme, section, segment_type, 
 
 ---
 
-## 9. Guardrails
+## 9. Guardrails (design-only — not yet implemented)
 
 **Input (pre-retrieval):**
 1. PII scrubber (regex + NER) — PAN/Aadhaar/account/OTP/email/phone → polite refusal.
@@ -183,7 +208,7 @@ pgvector schema: `chunks(chunk_id PK, source_id, scheme, section, segment_type, 
 
 ---
 
-## 10. Multi-thread chat
+## 10. Multi-thread chat (design-only — not yet implemented)
 
 - `thread_id` (UUID) per conversation. Session store: Redis (prod) / SQLite (dev), TTL 24h.
 - Thread message schema stores `messages[]` with role/content/ts, plus `metadata.last_scheme`.
@@ -198,23 +223,26 @@ pgvector schema: `chunks(chunk_id PK, source_id, scheme, section, segment_type, 
 |------------------|--------|
 | API              | FastAPI (Python 3.11) |
 | Orchestration    | LangGraph or thin custom |
-| Vector DB        | Chroma (dev) / Qdrant or pgvector (prod) |
-| Sparse index     | `rank_bm25` or OpenSearch |
-| Embeddings       | OpenAI `text-embedding-3-large` (primary) / `bge-large-en-v1.5` (local fallback) |
+| Vector DB        | **Chroma Cloud** (`api.trychroma.com`) — managed HNSW, cosine similarity. Adapter: `ChromaVectorIndex` (`phase_5_ingestion_cli/adapters/`). pgvector available as fallback via `vector_store.backend: pgvector` in config. |
+| Sparse index     | Postgres FTS (`tsvector` / GIN) via `PgBM25Index` |
+| Fact KV          | Postgres table `fact_kv` — exact-lookup fast path |
+| Embedding cache  | Postgres table `embedding_cache` (float32 BYTEA) |
+| Corpus pointer   | Postgres single-row `corpus_pointer` — atomic swap |
+| Embeddings       | `BAAI/bge-small-en-v1.5` 384-dim via `sentence-transformers` (primary) / OpenAI `text-embedding-3-large` (optional) |
 | Reranker         | `bge-reranker-base` or Cohere Rerank v3 |
-| LLM              | Claude Sonnet 4.6 (primary), Opus 4.7 (complex) |
+| LLM              | **Groq** `llama-3.3-70b-versatile` (primary) |
 | Session store    | Redis |
 | Web fetch        | Playwright (headless Chromium) + `httpx` fallback |
 | Scheduler        | **GitHub Actions** (`.github/workflows/ingest.yml`, `30 3 * * *` UTC) |
 | Scraping worker  | Step inside the `ingest` GitHub Actions job |
-| Document store   | Postgres + S3/MinIO (raw HTML snapshots) |
+| Document store   | S3/MinIO (raw HTML snapshots); Postgres for relational stores |
 | Frontend         | Next.js / React + Tailwind |
 | Observability    | OpenTelemetry → Grafana / Langfuse |
 | Deploy           | Docker + Fly.io / Render / AWS ECS |
 
 ---
 
-## 12. UI spec (minimal)
+## 12. UI spec (minimal) — design-only, not yet implemented
 
 - Welcome banner: "Ask me factual questions about mutual fund schemes."
 - **3 example chips** (tied to seed corpus):
@@ -229,9 +257,9 @@ pgvector schema: `chunks(chunk_id PK, source_id, scheme, section, segment_type, 
 
 ## 13. Evaluation
 
-- **Golden set:** 50–100 Q/A pairs (expense ratio, exit load, SIP min, ELSS lock-in, riskometer, benchmark, statement download, refusal cases).
-- **Metrics:** Recall@5, MRR, exact-fact accuracy, citation precision, groundedness %, refusal precision/recall, p50/p95 latency, tokens/query.
-- **CI gate:** regression suite on every ingestion refresh; blocks release if accuracy drops > 3 %.
+- **Shipped:** 99 pytest cases — 35 across phases 4.0/4.1 + 17 phase 5 + 47 phase 6 (RRF fusion, in-memory dense/BM25, HybridRetriever pipeline, scheme filter, threshold gate, query rewrite abbrevs + LLM mock, PassthroughReranker). Run: `pytest phase_4_scheduler_scraping/tests/ phase_4_1_chunk_embed_index/tests/ phase_5_ingestion_cli/tests/ phase_6_retrieval/tests/ -v`.
+- **Planned:** golden set of 50–100 Q/A pairs (expense ratio, exit load, SIP min, ELSS lock-in, riskometer, benchmark, statement download, refusal cases); metrics Recall@5, MRR, exact-fact accuracy, citation precision, groundedness %, refusal precision/recall, p50/p95 latency, tokens/query.
+- **CI gate (planned):** regression suite on every ingestion refresh; blocks release if accuracy drops > 3 %.
 
 ---
 
@@ -257,10 +285,15 @@ pgvector schema: `chunks(chunk_id PK, source_id, scheme, section, segment_type, 
 
 ## 16. Roadmap
 
-1. **v0.1** — 3 Groww URLs, HTML-only ingestion, Chroma + Claude, single-thread UI.
-2. **v0.2** — Hybrid retrieval + reranker, multi-thread, eval harness on 3-scheme golden set.
-3. **v0.3** — GitHub Actions ingestion live, Langfuse traces, refusal classifier.
-4. **v0.4** — Expand corpus with official AMC/AMFI/SEBI pages (and PDFs when available); table-aware extraction; groundedness judge in CI.
+- **Phase 4.0 (done):** GitHub Actions scheduler + scraping service (Playwright/httpx, Groww parser, validator, rate limiter, checksum diff, circuit breaker, drift alert, `ScrapeReport`, `DocumentChangedEvent`).
+- **Phase 4.1 (done):** Segmenter → chunker → normalizer → hasher → cache → embedder → index writer → snapshot manager. In-memory stores + fake deterministic embedder; protocol interfaces for prod swap-in.
+- **Phase 4.2 (done):** Prod backends behind the 4.1 protocols — `PgVectorIndex` (pgvector HNSW), `PgBM25Index` (Postgres FTS tsvector), `PgFactKV`, `PgEmbeddingCache` (BYTEA), `PgCorpusPointer`, `S3Storage` (boto3/MinIO), `StructuralSmokeRunner`, composition root in [phase_4_2_prod_wiring/composition.py](phase_4_2_prod_wiring/composition.py), 39 unit tests with fake psycopg + moto.
+- **Phase 5 (done):** Ingestion CLI (`phase_5_ingestion_cli/`) — `cli.py` (`run` + `purge`), `composition.py` (wires 4.1 pipeline onto 4.2 prod backends), `purge.py` (hard-purge cron for soft-deleted rows), `config/phase5.yaml`, 17 unit tests.
+- **Phase 6 (done):** Hybrid retrieval — `HybridRetriever` (dense cosine + BM25/FTS + RRF k=60 + `PassthroughReranker`/`CrossEncoderReranker`), `QueryRewriter` (Groq `llama-3.3-70b-versatile` + rule-based fallback), `PgDenseRetriever`/`PgSparseRetriever` adapters, `InMemoryDenseRetriever`/`InMemoryBM25Retriever` for tests. 47 unit tests. Code: `phase_6_retrieval/`.
+- **Phase 7 (done):** Generation (`phase_7_generation/`) — `Generator` (Groq `llama-3.3-70b-versatile`, JSON mode), `prompt.py` (system prompt + context formatter), `models.py` (`GenerationRequest`, `GenerationResponse`), `build_generator` factory. 48 unit tests (happy path, INSUFFICIENT_CONTEXT sentinel, LLM fallback, citation validation, confidence clamping). Code: `phase_7_generation/`.
+- **Phase 8:** Guardrails (PII, intent, injection; citation/length/advice/groundedness).
+- **Phase 9:** FastAPI + thread manager + Redis session store; Next.js UI.
+- **Phase 10:** Observability (OTLP + Langfuse), eval harness, CI gate, expand corpus to AMC/AMFI/SEBI.
 
 ---
 
@@ -281,12 +314,85 @@ pgvector schema: `chunks(chunk_id PK, source_id, scheme, section, segment_type, 
 
 ## 18. File map
 
+**Docs**
 - `doc/doc.md` — original problem statement (source of truth for requirements).
 - `doc/architecture.md` — full architecture with implementation detail (source of truth for design).
+- `doc/edgecase.md` — edge-case catalogue.
 - `CLAUDE.md` — this file (condensed working brief for future sessions).
-- `sources.yaml` — source registry (planned).
-- `.github/workflows/ingest.yml` — daily ingest workflow (planned).
-- `.github/workflows/retry-failed-ingest.yml` — retry companion (planned).
+
+**Phase 4.0 — Scheduler + Scraping (implemented)**
+- `.github/workflows/ingest.yml` — daily ingest workflow (cron `30 3 * * *`).
+- `.github/workflows/retry-failed-ingest.yml` — retry-on-failure companion.
+- `phase_4_scheduler_scraping/README.md` — phase overview.
+- `phase_4_scheduler_scraping/config/sources.yaml` — source registry (3 Groww URLs).
+- `phase_4_scheduler_scraping/config/scraper.yaml` — fetcher, retry, circuit breaker, drift thresholds.
+- `phase_4_scheduler_scraping/scheduler/cli.py` — `python -m scheduler.cli run`.
+- `phase_4_scheduler_scraping/scheduler/admin_trigger.py` — `dispatch_ingest()` via GitHub REST.
+- `phase_4_scheduler_scraping/scraping_service/service.py` — `ScrapingService` orchestrator.
+- `phase_4_scheduler_scraping/scraping_service/fetcher/fetcher.py` — Playwright + httpx + robots cache.
+- `phase_4_scheduler_scraping/scraping_service/parser/groww_parser.py` — `GrowwSchemePageParser`.
+- `phase_4_scheduler_scraping/scraping_service/validator/validator.py` — required-field + drift ratio.
+- `phase_4_scheduler_scraping/scraping_service/persistence/storage.py` — `LocalStorage`.
+- `phase_4_scheduler_scraping/scraping_service/rate_limit.py` — `TokenBucketRateLimiter`.
+- `phase_4_scheduler_scraping/scraping_service/models.py` — `Source`, `ParsedDocument`, `ScrapeReport`, `DocumentChangedEvent`, ….
+- `phase_4_scheduler_scraping/tests/` — 6 test files.
+
+**Phase 4.1 — Chunk/Embed/Index/Snapshot (implemented)**
+- `phase_4_1_chunk_embed_index/README.md` — phase overview.
+- `phase_4_1_chunk_embed_index/cli.py` — `python cli.py ingest --json … --source-id … …`.
+- `phase_4_1_chunk_embed_index/config/embedder.yaml` — provider/model/batch/cap.
+- `phase_4_1_chunk_embed_index/ingestion_pipeline/pipeline.py` — `IngestionPipeline.handle()`.
+- `phase_4_1_chunk_embed_index/ingestion_pipeline/models.py` — `Chunk`, `EmbeddedChunk`, `UpsertReport`, `IngestionResult`.
+- `phase_4_1_chunk_embed_index/ingestion_pipeline/segmenter/` — `DocumentSegmenter` (3 segment types).
+- `phase_4_1_chunk_embed_index/ingestion_pipeline/chunker/` — per-segment rules.
+- `phase_4_1_chunk_embed_index/ingestion_pipeline/normalizer/` — `normalize_for_display`, `normalize_for_hash`.
+- `phase_4_1_chunk_embed_index/ingestion_pipeline/hasher/` — `ChunkHasher`.
+- `phase_4_1_chunk_embed_index/ingestion_pipeline/embedding_cache/` — Protocol + `InMemoryEmbeddingCache`.
+- `phase_4_1_chunk_embed_index/ingestion_pipeline/embedder/` — `CachedEmbedder`, `FakeDeterministicEmbedder`, `build_embedder()` factory.
+- `phase_4_1_chunk_embed_index/ingestion_pipeline/index_writer/` — `IndexWriter` + in-memory `VectorIndex`/`BM25Index`/`FactKVStore`.
+- `phase_4_1_chunk_embed_index/ingestion_pipeline/snapshot/` — `SnapshotManager`, `CorpusPointer`.
+- `phase_4_1_chunk_embed_index/tests/` — 6 test files (~29 cases).
+
+**Phase 4.2 — Prod Wiring (implemented)**
+- [phase_4_2_prod_wiring/README.md](phase_4_2_prod_wiring/README.md) — phase overview.
+- [phase_4_2_prod_wiring/requirements.txt](phase_4_2_prod_wiring/requirements.txt) — psycopg[binary], pgvector, boto3, openai, sentence-transformers, moto.
+- [phase_4_2_prod_wiring/sql/schema.sql](phase_4_2_prod_wiring/sql/schema.sql) — DDL for `chunks` (HNSW), `bm25_docs` (tsvector GIN), `fact_kv`, `embedding_cache`, `corpus_pointer` + `corpus_history`.
+- [phase_4_2_prod_wiring/config/prod.yaml](phase_4_2_prod_wiring/config/prod.yaml) — `${ENV_VAR:default}` templated sample.
+- [phase_4_2_prod_wiring/adapters/pg_vector_index.py](phase_4_2_prod_wiring/adapters/pg_vector_index.py) — `PgVectorIndex`.
+- [phase_4_2_prod_wiring/adapters/pg_bm25_index.py](phase_4_2_prod_wiring/adapters/pg_bm25_index.py) — `PgBM25Index`.
+- [phase_4_2_prod_wiring/adapters/pg_fact_kv.py](phase_4_2_prod_wiring/adapters/pg_fact_kv.py) — `PgFactKV`.
+- [phase_4_2_prod_wiring/adapters/pg_embedding_cache.py](phase_4_2_prod_wiring/adapters/pg_embedding_cache.py) — `PgEmbeddingCache` (struct-packed float32 BYTEA).
+- [phase_4_2_prod_wiring/adapters/pg_corpus_pointer.py](phase_4_2_prod_wiring/adapters/pg_corpus_pointer.py) — `PgCorpusPointer`.
+- [phase_4_2_prod_wiring/adapters/s3_storage.py](phase_4_2_prod_wiring/adapters/s3_storage.py) — `S3Storage` (boto3 w/ `endpoint_url` for MinIO).
+- [phase_4_2_prod_wiring/smoke/runner.py](phase_4_2_prod_wiring/smoke/runner.py) — `StructuralSmokeRunner` (chunk count + required sources + required facts).
+- [phase_4_2_prod_wiring/composition.py](phase_4_2_prod_wiring/composition.py) — `build_prod_pipeline(config_path)` returning `ProdPipeline`.
+- [phase_4_2_prod_wiring/tests/](phase_4_2_prod_wiring/tests/) — 8 test files, 39 cases; fake psycopg + moto so no real DB/S3 needed.
+
+**Phase 5 — Ingestion CLI (implemented)**
+- [phase_5_ingestion_cli/__init__.py](phase_5_ingestion_cli/__init__.py)
+- [phase_5_ingestion_cli/composition.py](phase_5_ingestion_cli/composition.py) — `build_ingestion_pipeline(prod)` wiring root; selects Chroma or pgvector backend from config.
+- [phase_5_ingestion_cli/adapters/chroma_vector_index.py](phase_5_ingestion_cli/adapters/chroma_vector_index.py) — `ChromaVectorIndex`: Chroma Cloud implementation of the `VectorIndex` protocol (upsert, soft-delete, hard-purge, count, distinct_source_ids).
+- [phase_5_ingestion_cli/purge.py](phase_5_ingestion_cli/purge.py) — `hard_purge_deleted_chunks(vector_index, cutoff_days)`.
+- [phase_5_ingestion_cli/cli.py](phase_5_ingestion_cli/cli.py) — `run` (report or single-source) + `purge` subcommands.
+- [phase_5_ingestion_cli/config/phase5.yaml](phase_5_ingestion_cli/config/phase5.yaml) — prod config with env-var expansion.
+- [phase_5_ingestion_cli/requirements.txt](phase_5_ingestion_cli/requirements.txt)
+- [phase_5_ingestion_cli/tests/](phase_5_ingestion_cli/tests/) — 3 test files, 17 cases; fake psycopg (from 4.2 conftest), no real DB/S3.
+
+**Phase 6 — Hybrid Retrieval (implemented)**
+- [phase_6_retrieval/__init__.py](phase_6_retrieval/__init__.py)
+- [phase_6_retrieval/models.py](phase_6_retrieval/models.py) — `RetrievalQuery`, `CandidateChunk`, `RetrievalResult`.
+- [phase_6_retrieval/protocols.py](phase_6_retrieval/protocols.py) — `DenseRetriever`, `SparseRetriever`, `Reranker` structural protocols.
+- [phase_6_retrieval/fusion.py](phase_6_retrieval/fusion.py) — `rrf_fuse(dense, sparse, k=60, top_k=15)` RRF implementation.
+- [phase_6_retrieval/reranker.py](phase_6_retrieval/reranker.py) — `PassthroughReranker`, `CrossEncoderReranker` (lazy sentence-transformers), `build_reranker(config)`.
+- [phase_6_retrieval/query_rewrite.py](phase_6_retrieval/query_rewrite.py) — `QueryRewriter` (Groq `llama-3.3-70b-versatile` + rule-based abbrev fallback), `expand_abbreviations()`, `build_query_rewriter(config)`.
+- [phase_6_retrieval/retriever.py](phase_6_retrieval/retriever.py) — `HybridRetriever.retrieve()` orchestrating all stages.
+- [phase_6_retrieval/adapters/pg_dense_retriever.py](phase_6_retrieval/adapters/pg_dense_retriever.py) — `PgDenseRetriever` (pgvector `<=>` cosine).
+- [phase_6_retrieval/adapters/pg_sparse_retriever.py](phase_6_retrieval/adapters/pg_sparse_retriever.py) — `PgSparseRetriever` (Postgres FTS `ts_rank_cd`).
+- [phase_6_retrieval/adapters/in_memory_retriever.py](phase_6_retrieval/adapters/in_memory_retriever.py) — `InMemoryDenseRetriever` (cosine scan) + `InMemoryBM25Retriever` (BM25 k1=1.5 b=0.75).
+- [phase_6_retrieval/config/retrieval.yaml](phase_6_retrieval/config/retrieval.yaml) — retrieval config (top-k, threshold, reranker, query rewrite).
+- [phase_6_retrieval/tests/](phase_6_retrieval/tests/) — 47 cases: fusion, retriever pipeline, query rewrite, reranker.
+
+**Not yet implemented:** API (FastAPI), generation, guardrails, session store (Redis), frontend (Next.js), OTLP/Langfuse observability, eval harness.
 
 When design questions arise, prefer `doc/architecture.md` for detail; use this file for quick recall.
 @doc.md - basic understanding of project

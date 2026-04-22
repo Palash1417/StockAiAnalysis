@@ -1,0 +1,21 @@
+retrieval:
+  top_k_dense: 20
+  top_k_sparse: 20
+  top_k_rrf: 15
+  top_n_rerank: 5
+  score_threshold: 0.35
+  rrf_k: 60
+
+dense:
+  backend: pgvector          # pgvector | in_memory
+
+sparse:
+  backend: postgres_fts      # postgres_fts | in_memory
+
+reranker:
+  provider: passthrough      # passthrough | cross_encoder
+  model: BAAI/bge-reranker-base
+
+query_rewrite:
+  use_llm: true
+  model: llama-3.3-70b-versatile

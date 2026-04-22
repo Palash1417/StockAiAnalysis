@@ -1,0 +1,7 @@
+# Phase 7 — Generation config (§7.2)
+# GROQ_API_KEY must be set in the environment (.env or GitHub Actions secret).
+
+generation:
+  model: llama-3.3-70b-versatile   # primary Groq model (§7.2)
+  temperature: 0.1                  # 0.0–0.2 for factual consistency
+  max_tokens: 512                   # ≤3 sentences + JSON overhead

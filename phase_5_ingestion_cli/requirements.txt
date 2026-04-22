@@ -1,0 +1,20 @@
+# Phase 5 — ingestion CLI dependencies.
+# Install from the project root:
+#   pip install -r phase_5_ingestion_cli/requirements.txt
+
+# Phase 4.1 deps (chunking/embedding)
+tiktoken>=0.6
+sentence-transformers>=2.7
+pyyaml>=6.0
+
+# Phase 4.2 deps (Postgres: BM25, fact_kv, embedding_cache, corpus_pointer)
+psycopg[binary]>=3.1
+pgvector>=0.3.0          # only needed if vector_store.backend=pgvector
+boto3>=1.34
+
+# Vector store — Chroma Cloud
+chromadb>=0.5.0          # client only; no local server needed for cloud mode
+
+# Testing
+pytest>=8.0
+moto[s3]>=5.0

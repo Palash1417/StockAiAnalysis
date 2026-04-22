@@ -1,5 +1,7 @@
 # RAG Architecture: Mutual Fund FAQ Assistant
 
+> **Implementation status (2026-04-19).** Phase 4.0 (scheduler + scraping), Phase 4.1 (chunk/embed/index/snapshot), Phase 4.2 (prod wiring — pgvector + Postgres FTS + fact_kv + embedding_cache + corpus_pointer + S3/MinIO), and Phase 5 (ingestion CLI — composes 4.1 + 4.2, hard-purge cron) are coded and unit-tested. Sections tagged **[IMPLEMENTED]** map to existing Python code under `phase_4_scheduler_scraping/`, `phase_4_1_chunk_embed_index/`, `phase_4_2_prod_wiring/`, and `phase_5_ingestion_cli/`. Sections tagged **[DESIGN-ONLY]** are not yet built (retrieval, generation, guardrails, API, session store, UI, evaluation). See §17 for the implementation map.
+
 ## 1. Executive Summary
 
 This document describes a detailed Retrieval-Augmented Generation (RAG) architecture for a **facts-only Mutual Fund FAQ Assistant**. The system retrieves answers exclusively from curated, official public sources (AMC, AMFI, SEBI) and produces concise, cited, compliance-safe responses. It refuses advisory queries and supports multiple concurrent chat threads.
@@ -134,7 +136,7 @@ Stored as `sources.yaml`:
 
 ---
 
-## 4. Ingestion Pipeline
+## 4. Ingestion Pipeline  **[IMPLEMENTED — phases 4.0 + 4.1]**
 
 ### 4.1 Stages
 
@@ -160,7 +162,7 @@ Stored as `sources.yaml`:
      "doc_type": "scheme_page"
    }
    ```
-6. **Embed** — `text-embedding-3-large` or `bge-large-en-v1.5`; batch + cache by checksum.
+6. **Embed** — `BAAI/bge-small-en-v1.5` (default) via `sentence-transformers`; batch + cache by checksum.
 7. **Index** — upsert into vector store with metadata + BM25 sidecar index for hybrid search.
 8. **Snapshot** — version the corpus (`corpus_v2026_04_19`) so answers are reproducible.
 
@@ -169,7 +171,9 @@ Stored as `sources.yaml`:
 - `last_updated` propagates into citations.
 - Stale corpus warning if any source is > 48 hours old (alert on 2 consecutive missed runs).
 
-### 4.3 Scheduler — GitHub Actions
+### 4.3 Scheduler — GitHub Actions  **[IMPLEMENTED]**
+
+**Code:** `.github/workflows/ingest.yml`, `.github/workflows/retry-failed-ingest.yml`, admin dispatch in `phase_4_scheduler_scraping/scheduler/admin_trigger.py` (`dispatch_ingest()`).
 
 **Responsibility:** trigger the Scraping Service daily and guarantee the corpus stays fresh. Chosen implementation: **GitHub Actions scheduled workflow** (zero-infra, free tier, version-controlled with the code).
 
@@ -203,8 +207,7 @@ jobs:
     env:
       TZ: Asia/Kolkata
       RUN_ID: ingest_${{ github.run_id }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
       VECTOR_DB_URL: ${{ secrets.VECTOR_DB_URL }}
       S3_BUCKET: ${{ secrets.S3_BUCKET }}
     steps:
@@ -252,7 +255,9 @@ jobs:
 - ⚠️ No native retry on scheduled triggers — handled via the companion retry workflow.
 - ⚠️ Ephemeral runners — all state (vector index, raw HTML) must live in external stores (S3/MinIO + vector DB), not the runner FS.
 
-### 4.4 Scraping Service
+### 4.4 Scraping Service  **[IMPLEMENTED]**
+
+**Code:** `phase_4_scheduler_scraping/scraping_service/` — `service.ScrapingService`, `fetcher.Fetcher` + `RobotsCache`, `parser.GrowwSchemePageParser`, `validator.Validator`, `persistence.LocalStorage`, `rate_limit.TokenBucketRateLimiter`, `models.{Source,ParsedDocument,ScrapeResult,ScrapeReport,DocumentChangedEvent}`. CLI: `phase_4_scheduler_scraping/scheduler/cli.py` (`python -m scheduler.cli run`).
 
 **Responsibility:** given the source registry (§3.2), fetch each URL, produce normalized documents, and hand them to the chunking + embedding stages. Runs as an isolated, stateless worker so it can be invoked by the scheduler, a queue, or a CLI.
 
@@ -308,7 +313,11 @@ class ScrapingService:
 
 ---
 
-## 5. Chunking & Embedding Architecture
+## 5. Chunking & Embedding Architecture  **[IMPLEMENTED]**
+
+**Code:** `phase_4_1_chunk_embed_index/ingestion_pipeline/` — `pipeline.IngestionPipeline`, `segmenter.DocumentSegmenter`, `chunker.Chunker`, `normalizer.{normalize_for_display,normalize_for_hash}`, `hasher.ChunkHasher`, `embedding_cache.{EmbeddingCache,InMemoryEmbeddingCache}`, `embedder.{CachedEmbedder,FakeDeterministicEmbedder,build_embedder}`, `index_writer.IndexWriter`, `snapshot.{SnapshotManager,CorpusPointer}`. CLI: `phase_4_1_chunk_embed_index/cli.py` (`python cli.py ingest …`). Config: `phase_4_1_chunk_embed_index/config/embedder.yaml`.
+
+**What's live:** in-memory implementations of `VectorIndex`, `BM25Index`, `FactKVStore`, `CorpusPointer`, `EmbeddingCache`; `FakeDeterministicEmbedder` (64-dim, SHA-derived, L2-normalized) is the default for tests + local dev. `build_embedder(config)` dispatches on `provider` ∈ {`fake`, `bge_local`, `openai`}. Default provider is `bge_local` (`BAAI/bge-small-en-v1.5`, 384 dims).
 
 This section is the detailed design for how a **changed** document (emitted by the Scraping Service as `DocumentChangedEvent`) becomes searchable vectors + a BM25 index. The stage is invoked inside the same GitHub Actions job (§4.3) after scraping completes.
 
@@ -416,21 +425,21 @@ Cache: Postgres table `embedding_cache(chunk_hash PK, embedding BYTEA, dim INT, 
 
 ### 5.6 Embedding Model
 
-**Primary:** `text-embedding-3-large` (OpenAI) — 3072 dims, strong on short factual queries.
+**Primary:** `BAAI/bge-small-en-v1.5` (384 dims) via `sentence-transformers` — runs locally with no external API, no cost, suitable for CI and GitHub Actions runners.
 
-**Local fallback:** `BAAI/bge-large-en-v1.5` (1024 dims) running via `sentence-transformers` — used when running on the GitHub Actions runner without egress to OpenAI.
+**Alternative:** `OpenAI text-embedding-3-large` (3072 dims) — higher quality, but requires `OPENAI_API_KEY` and incurs per-token cost. Note: Groq does not provide an embeddings endpoint; the local `bge_local` provider is the recommended default.
 
 **Selection lives in config** so switching is a one-line change:
 ```yaml
 embedder:
-  provider: openai           # openai | bge_local
-  model: text-embedding-3-large
-  dim: 3072
+  provider: bge_local        # bge_local | openai | fake
+  model: BAAI/bge-small-en-v1.5
+  dim: 384
   batch_size: 64
   normalize: true            # L2-normalize vectors for cosine ≡ dot product
 ```
 
-**Model versioning:** `embed_model_id = "openai/text-embedding-3-large@2024-01"`. Every vector row stores this id; a model change triggers a **shadow-rebuild** (§5.9), not an in-place swap.
+**Model versioning:** `embed_model_id = "bge_local/BAAI/bge-small-en-v1.5@v1"`. Every vector row stores this id; a model change triggers a **shadow-rebuild** (§5.9), not an in-place swap.
 
 ### 5.7 Batching & Rate Limits
 
@@ -443,31 +452,34 @@ embedder:
 
 Writes go to **three stores**, atomically per chunk:
 
-| Store              | Purpose                                   | Key                         |
-|--------------------|-------------------------------------------|-----------------------------|
-| **Vector DB**      | Dense retrieval (cosine)                  | `chunk_id` → (vector, metadata) |
-| **BM25 index**     | Sparse retrieval (keyword)                | `chunk_id` → tokenized text  |
-| **Fact KV store**  | Exact-lookup fast path for `fact_table` chunks | `(scheme_id, field_name)` → value + source_url + last_updated |
+| Store              | Purpose                                   | Key                         | Backend (prod)              |
+|--------------------|-------------------------------------------|-----------------------------|-----------------------------|
+| **Vector DB**      | Dense retrieval (cosine)                  | `chunk_id` → (vector, metadata) | **Chroma Cloud** (`ChromaVectorIndex`) |
+| **BM25 index**     | Sparse retrieval (keyword)                | `chunk_id` → tokenized text  | Postgres FTS (`PgBM25Index`) |
+| **Fact KV store**  | Exact-lookup fast path for `fact_table` chunks | `(scheme_id, field_name)` → value + source_url + last_updated | Postgres (`PgFactKV`) |
 
-Vector DB config (pgvector example):
-```sql
-CREATE TABLE chunks (
-  chunk_id        text PRIMARY KEY,
-  source_id       text NOT NULL,
-  scheme          text NOT NULL,
-  section         text,
-  segment_type    text NOT NULL,   -- fact_table | section_text | table
-  text            text NOT NULL,
-  embedding       vector(3072) NOT NULL,
-  embed_model_id  text NOT NULL,
-  chunk_hash      text NOT NULL,
-  source_url      text NOT NULL,
-  last_updated    date NOT NULL,
-  corpus_version  text NOT NULL
-);
-CREATE INDEX ON chunks USING hnsw (embedding vector_cosine_ops);
-CREATE INDEX ON chunks (scheme, segment_type);
+**Chroma Cloud storage model** (`ChromaVectorIndex`):
+- One collection (`mf_rag`) for the whole deployment; `corpus_version` is stored as a metadata field on each document so shadow-rebuilds and the atomic pointer swap work without creating/deleting collections.
+- Soft-delete: `update()` patches `deleted: "true"` + `deleted_at_ts` (Unix epoch int) in metadata without re-uploading embeddings.
+- Hard-purge: filters `deleted=true AND deleted_at_ts <= cutoff` using Chroma's `$lte` operator, then calls `delete(ids=[...])`.
+- `corpus_pointer` (atomic swap) and `embedding_cache` remain in Postgres — Chroma has no equivalent relational capability.
+
+```python
+# Chroma Cloud connection (phase_5_ingestion_cli/adapters/chroma_vector_index.py)
+client = chromadb.HttpClient(
+    host="api.trychroma.com",
+    ssl=True,
+    headers={"x-chroma-token": CHROMA_API_KEY},
+    tenant=CHROMA_TENANT,
+    database=CHROMA_DATABASE,
+)
+collection = client.get_or_create_collection(
+    name="mf_rag",
+    metadata={"hnsw:space": "cosine"},
+)
 ```
+
+pgvector remains available as a local/CI fallback (`vector_store.backend: pgvector` in `phase5.yaml`). The `chunks` table in `schema.sql` is only used when pgvector backend is selected.
 
 **Upsert semantics:** primary key is `chunk_id`; same id with a new `chunk_hash` overwrites.
 
@@ -529,7 +541,7 @@ class IndexWriter:
 
 ---
 
-## 6. Retrieval
+## 6. Retrieval  **[DESIGN-ONLY — not yet implemented]**
 
 ### 6.1 Hybrid Retrieval
 - **Dense**: vector similarity (cosine) — top-K = 20.
@@ -550,7 +562,7 @@ Current corpus is single-class (`groww` scheme pages). Tie-breaker when multiple
 
 ---
 
-## 7. Generation
+## 7. Generation  **[DESIGN-ONLY — not yet implemented]**
 
 ### 7.1 Prompt Contract
 System prompt enforces:
@@ -562,8 +574,8 @@ System prompt enforces:
 - Never provide advice, recommendations, performance comparisons, or return calculations.
 
 ### 7.2 Model Choice
-- Primary: **Claude Sonnet 4.6** (fast, cost-efficient, strong instruction-following).
-- Optional upgrade: **Claude Opus 4.7** for complex schemes/tables.
+- Primary: **Groq — `llama-3.3-70b-versatile`** (fast inference, cost-efficient, strong instruction-following).
+- Optional upgrade: `llama-3.1-405b-reasoning` or similar large model for complex schemes/tables.
 - Temperature: 0.0–0.2 for factual consistency.
 
 ### 7.3 Generator Output Schema
@@ -579,7 +591,7 @@ System prompt enforces:
 
 ---
 
-## 8. Guardrails
+## 8. Guardrails  **[DESIGN-ONLY — not yet implemented]**
 
 ### 8.1 Pre-Retrieval (Input Guard)
 1. **PII scrubber** — regex + NER to block PAN / Aadhaar / account / OTP / email / phone; reject with polite refusal.
@@ -606,7 +618,7 @@ see AMFI's investor education: https://www.amfiindia.com/investor-corner"
 
 ---
 
-## 9. Multi-Thread Chat Support
+## 9. Multi-Thread Chat Support  **[DESIGN-ONLY — not yet implemented]**
 
 ### 9.1 Thread Model
 - `thread_id` (UUID) generated per new conversation.
@@ -631,7 +643,7 @@ see AMFI's investor education: https://www.amfiindia.com/investor-corner"
 
 ---
 
-## 10. User Interface
+## 10. User Interface  **[DESIGN-ONLY — not yet implemented]**
 
 - Minimal single-page app (React/Next.js or plain HTML + HTMX).
 - Components:
@@ -652,16 +664,19 @@ see AMFI's investor education: https://www.amfiindia.com/investor-corner"
 |-----------------|----------------------------------------------------|
 | API             | FastAPI (Python 3.11)                              |
 | Orchestration   | LangGraph or a thin custom orchestrator            |
-| Vector DB       | Chroma (dev) / Qdrant or pgvector (prod)           |
-| Sparse index    | BM25 via `rank_bm25` or OpenSearch                 |
-| Embeddings      | OpenAI `text-embedding-3-large` (primary) / `bge-large-en-v1.5` (local fallback) |
+| Vector DB       | **Chroma Cloud** (`api.trychroma.com`) — managed HNSW, cosine similarity, no self-hosted infra. Adapter: `ChromaVectorIndex` in `phase_5_ingestion_cli/adapters/`. pgvector remains available as a fallback (`vector_store.backend: pgvector` in config). |
+| Sparse index    | Postgres FTS (`tsvector` / GIN index) — `PgBM25Index` in phase 4.2 |
+| Fact KV         | Postgres table `fact_kv` — exact-lookup fast path  |
+| Embedding cache | Postgres table `embedding_cache` (float32 BYTEA)   |
+| Corpus pointer  | Postgres single-row `corpus_pointer` — atomic swap |
+| Embeddings      | `BAAI/bge-small-en-v1.5` 384-dim via `sentence-transformers` (primary) / OpenAI `text-embedding-3-large` (optional) |
 | Reranker        | `bge-reranker-base` or Cohere Rerank v3            |
-| LLM             | Claude Sonnet 4.6 (primary)                        |
+| LLM             | **Groq** `llama-3.3-70b-versatile` (primary) — OpenAI-compatible API; `GROQ_API_KEY` required |
 | Session store   | Redis                                              |
 | Web fetch       | Playwright (headless Chromium) for JS-rendered Groww pages; `httpx` fallback |
 | Scheduler       | **GitHub Actions** — `.github/workflows/ingest.yml`, cron `30 3 * * *` UTC (= 09:00 IST) |
 | Scraping worker | Step inside the `ingest` GitHub Actions job (Playwright + BeautifulSoup) |
-| Document store  | Postgres + S3/MinIO for raw HTML snapshots         |
+| Document store  | S3/MinIO for raw HTML snapshots; Postgres for relational stores |
 | Frontend        | Next.js / React + Tailwind                         |
 | Observability   | OpenTelemetry → Grafana / Langfuse for LLM traces  |
 | Deploy          | Docker + Fly.io / Render / AWS ECS                 |
@@ -709,14 +724,19 @@ Regression test suite runs on every ingestion refresh; blocks release if accurac
 
 ## 15. Roadmap
 
-1. **v0.1** — Three Groww URLs, HTML-only ingestion, Chroma + Claude, single-thread UI.
-2. **v0.2** — Hybrid retrieval + reranker, multi-thread, eval harness on 3-scheme golden set.
-3. **v0.3** — Scheduled Playwright ingestion, Langfuse traces, refusal classifier.
-4. **v0.4** — Expand corpus with official AMC/AMFI/SEBI pages (and PDFs: factsheet/KIM/SID when available); table-aware extraction; groundedness judge in CI.
+- **Phase 4.0** ✅ *done* — GitHub Actions scheduler + scraping service (Playwright/httpx, Groww parser, validator, rate limiter, checksum diff, circuit breaker, drift alert, `ScrapeReport`, `DocumentChangedEvent`). Code: `phase_4_scheduler_scraping/`.
+- **Phase 4.1** ✅ *done* — Segmenter → chunker → normalizer → hasher → cache → embedder → index writer → snapshot manager. In-memory stores + `FakeDeterministicEmbedder`; Protocol interfaces for prod swap-in. Code: `phase_4_1_chunk_embed_index/`.
+- **Phase 4.2** ✅ *done* — Prod backends behind the 4.1 Protocols: `PgVectorIndex` (pgvector HNSW), `PgBM25Index` (Postgres FTS tsvector/GIN), `PgFactKV`, `PgEmbeddingCache` (BYTEA float32 blobs), `PgCorpusPointer`, `S3Storage` (boto3 — MinIO-compatible via `endpoint_url`), `StructuralSmokeRunner`, `build_prod_pipeline()` composition root, and SQL DDL. OpenAI/BGE embedder classes were already present in 4.1 (lazy-imported). 39 unit tests with a fake psycopg + moto. Code: `phase_4_2_prod_wiring/`.
+- **Phase 5** ✅ *done* — Ingestion CLI (`phase_5_ingestion_cli/`) that composes phase 4.1 pipeline with phase 4.2 backends. `cli.py` (`run` + `purge` subcommands), `composition.py` (wiring root), `purge.py` (hard-purge cron), `config/phase5.yaml`, 17 unit tests (fake psycopg + no real DB/S3 needed).
+- **Phase 6** — Hybrid retrieval (§6): dense + BM25 + RRF + cross-encoder rerank; query rewrite using last 4 turns.
+- **Phase 7** — Generation (§7): Claude Sonnet 4.6, structured JSON output contract.
+- **Phase 8** — Guardrails (§8): PII scrubber, intent classifier, prompt-injection filter; citation/length/advice/groundedness output guards.
+- **Phase 9** — API + UI: FastAPI thread manager, Redis session store, Next.js frontend with sticky disclaimer and example chips.
+- **Phase 10** — Observability (OTLP + Langfuse), evaluation harness + golden set, CI gate, corpus expansion to official AMC/AMFI/SEBI sources + PDFs (factsheet/KIM/SID).
 
 ---
 
-## 16. Request Lifecycle (End-to-End)
+## 16. Request Lifecycle (End-to-End)  **[DESIGN-ONLY — lifecycle depends on phases 6–9]**
 
 1. User sends query on thread `T`.
 2. API validates + PII scrub + intent classify.
@@ -728,3 +748,41 @@ Regression test suite runs on every ingestion refresh; blocks release if accurac
 8. Output guards: citation validity, length, advice detector, groundedness.
 9. Persist assistant message on thread `T`; emit telemetry.
 10. Return answer + citation + `Last updated` footer to UI.
+
+---
+
+## 17. Implementation Map (code → section)
+
+| Section | Status | Code location |
+|---------|--------|---------------|
+| §3.2 source registry | ✅ | `phase_4_scheduler_scraping/config/sources.yaml` |
+| §4.3 scheduler | ✅ | `.github/workflows/ingest.yml`, `.github/workflows/retry-failed-ingest.yml`, `phase_4_scheduler_scraping/scheduler/` |
+| §4.4 scraping service | ✅ | `phase_4_scheduler_scraping/scraping_service/` |
+| §5.2 segmenter | ✅ | `phase_4_1_chunk_embed_index/ingestion_pipeline/segmenter/` |
+| §5.3 chunker | ✅ | `phase_4_1_chunk_embed_index/ingestion_pipeline/chunker/` |
+| §5.4 normalizer | ✅ | `phase_4_1_chunk_embed_index/ingestion_pipeline/normalizer/` |
+| §5.5 hasher | ✅ | `phase_4_1_chunk_embed_index/ingestion_pipeline/hasher/` |
+| §5.5 embedding cache (in-memory) | ✅ | `phase_4_1_chunk_embed_index/ingestion_pipeline/embedding_cache/` |
+| §5.5 embedding cache (Postgres) | ✅ | `phase_4_2_prod_wiring/adapters/pg_embedding_cache.py` |
+| §5.6 embedder (fake) | ✅ | `phase_4_1_chunk_embed_index/ingestion_pipeline/embedder/` |
+| §5.6 embedder (bge-small-en-v1.5 primary) | ✅ lazy-imported sentence-transformers | `phase_4_1_chunk_embed_index/ingestion_pipeline/embedder/embedder.py` |
+| §5.7 batching + retry + cap | ✅ | `phase_4_1_chunk_embed_index/ingestion_pipeline/embedder/embedder.py` |
+| §5.8 index writer (three stores) | ✅ in-memory | `phase_4_1_chunk_embed_index/ingestion_pipeline/index_writer/` |
+| §5.8 pgvector VectorIndex | ✅ | `phase_4_2_prod_wiring/adapters/pg_vector_index.py` |
+| §5.8 BM25 (Postgres FTS) | ✅ | `phase_4_2_prod_wiring/adapters/pg_bm25_index.py` |
+| §5.8 FactKV (Postgres) | ✅ | `phase_4_2_prod_wiring/adapters/pg_fact_kv.py` |
+| §5.9 snapshot + atomic swap (in-memory pointer) | ✅ | `phase_4_1_chunk_embed_index/ingestion_pipeline/snapshot/` |
+| §5.9 corpus pointer (Postgres) | ✅ | `phase_4_2_prod_wiring/adapters/pg_corpus_pointer.py` |
+| §5.9 smoke runner (structural) | ✅ | `phase_4_2_prod_wiring/smoke/runner.py` |
+| §4.4 storage (S3/MinIO) | ✅ | `phase_4_2_prod_wiring/adapters/s3_storage.py` |
+| SQL DDL | ✅ | `phase_4_2_prod_wiring/sql/schema.sql` |
+| Prod composition root | ✅ | `phase_4_2_prod_wiring/composition.py` |
+| §5 ingestion CLI (phase 5) | ✅ | `phase_5_ingestion_cli/` |
+| §5.8 VectorIndex — Chroma Cloud | ✅ | `phase_5_ingestion_cli/adapters/chroma_vector_index.py` |
+| §6 retrieval | ❌ | — |
+| §7 generation | ❌ | — |
+| §8 guardrails | ❌ | — |
+| §9 multi-thread chat | ❌ | — |
+| §10 UI | ❌ | — |
+| §12 evaluation | 🟡 unit tests only | `phase_4_*/tests/` (35 cases); golden set not built |
+| §13 security & privacy | 🟡 partial | No PII is handled yet because there is no request path |

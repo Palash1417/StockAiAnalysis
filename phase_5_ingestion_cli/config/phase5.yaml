@@ -1,0 +1,69 @@
+# Phase 5 ingestion CLI — prod configuration.
+# Environment variables are expanded at load time (${VAR} or ${VAR:default}).
+
+embedder:
+  provider: bge_local               # bge_local | openai | fake
+  model: BAAI/bge-small-en-v1.5
+  dim: 384
+  batch_size: 64
+  normalize: true
+  hard_cap_per_run: 1000
+  retry_backoff_seconds: [1, 3, 9, 27]
+  max_attempts: 5
+
+# ---------------------------------------------------------------------------
+# Vector store — Chroma Cloud (prod default)
+# ---------------------------------------------------------------------------
+# Dense retrieval (cosine similarity) is served by Chroma Cloud.
+# Chroma handles HNSW indexing, replication, and backups — no self-hosted
+# pgvector extension required.
+#
+# Switch to pgvector for local dev / CI without a Chroma key:
+#   vector_store:
+#     backend: pgvector
+# ---------------------------------------------------------------------------
+vector_store:
+  backend: chroma                   # chroma | pgvector
+
+  chroma:
+    api_key: ${CHROMA_API_KEY}      # Chroma Cloud API key (trychroma.com)
+    collection: mf_rag              # one collection per deployment
+    tenant: ${CHROMA_TENANT:default_tenant}
+    database: ${CHROMA_DATABASE:default_database}
+
+# ---------------------------------------------------------------------------
+# Postgres — BM25 (FTS), fact_kv, embedding_cache, corpus_pointer
+# ---------------------------------------------------------------------------
+# Postgres is still required for sparse retrieval (tsvector/GIN), exact-lookup
+# fact KV, the embedding cache, and the corpus pointer atomic swap.
+# The `chunks` table and HNSW index in schema.sql are NOT used when
+# backend=chroma; all vector operations go to Chroma Cloud.
+# ---------------------------------------------------------------------------
+postgres:
+  dsn: ${VECTOR_DB_URL}             # postgresql://user:pw@host:5432/mf_rag
+  application_name: mf-rag-ingest-phase5
+  statement_timeout_ms: 30000
+
+s3:
+  bucket: ${S3_BUCKET}              # e.g. mf-rag-corpus
+  endpoint_url: ${S3_ENDPOINT_URL:} # set for MinIO; leave empty for real S3
+  region: ${AWS_REGION:ap-south-1}
+
+smoke:
+  # Structural gate (§5.9): checked against Chroma (chunk count, source_ids)
+  # and Postgres fact_kv (required facts), before the corpus pointer flips.
+  min_chunks: 10
+  required_sources:
+    - src_001
+    - src_002
+    - src_003
+  required_facts:
+    - [src_001, expense_ratio]
+    - [src_002, expense_ratio]
+    - [src_003, expense_ratio]
+    - [src_001, exit_load]
+    - [src_002, exit_load]
+    - [src_003, exit_load]
+
+snapshot:
+  keep_versions: 7

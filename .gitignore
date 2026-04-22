@@ -7,3 +7,6 @@ __pycache__/
 node_modules/
 .venv/
 venv/
+.next/
+data/
+logs/

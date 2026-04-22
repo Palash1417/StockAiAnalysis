@@ -1,0 +1,43 @@
+# Phase 4.2 prod wiring — sample configuration.
+# Environment variables are expanded at load time (${VAR} or ${VAR:default}).
+
+embedder:
+  provider: bge_local               # bge_local | openai | fake
+  model: BAAI/bge-small-en-v1.5
+  dim: 384
+  batch_size: 64
+  normalize: true
+
+postgres:
+  dsn: ${VECTOR_DB_URL}            # postgresql://user:pw@host:5432/mf_rag
+  # Applies to all PG-backed adapters (vector, bm25, fact_kv, cache, pointer).
+  application_name: mf-rag-ingest
+  statement_timeout_ms: 30000
+
+s3:
+  bucket: ${S3_BUCKET}             # e.g. mf-rag-corpus
+  endpoint_url: ${S3_ENDPOINT_URL:} # set for MinIO; leave empty for real S3
+  region: ${AWS_REGION:ap-south-1}
+
+smoke:
+  # Structural gate — retrieval/generation land in Phase 5. Until then, the
+  # smoke runner only checks that the candidate corpus_version is physically
+  # well-formed:
+  #   * minimum chunk count
+  #   * at least one row per source_id in the registry
+  #   * fact_kv has an entry for every (scheme_id, field_name) required field
+  min_chunks: 10
+  required_sources:
+    - src_001
+    - src_002
+    - src_003
+  required_facts:
+    - [src_001, expense_ratio]
+    - [src_002, expense_ratio]
+    - [src_003, expense_ratio]
+    - [src_001, exit_load]
+    - [src_002, exit_load]
+    - [src_003, exit_load]
+
+snapshot:
+  keep_versions: 7
