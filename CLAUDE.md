@@ -238,7 +238,7 @@ Code: `snapshot/` — `SnapshotManager`, `SmokeQuery`, `CorpusPointer` Protocol,
 | Document store   | S3/MinIO (raw HTML snapshots); Postgres for relational stores |
 | Frontend         | Next.js / React + Tailwind |
 | Observability    | OpenTelemetry → Grafana / Langfuse |
-| Deploy           | Docker + Fly.io / Render / AWS ECS |
+| Deploy           | **Railway** (backend, free tier) + **Vercel** (frontend, free) |
 
 ---
 
