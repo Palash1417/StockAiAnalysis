@@ -1,9 +1,9 @@
 # Railway deployment config — free tier, no card required.
 # Docs: https://docs.railway.app/reference/config-as-code
-
-[build]
-builder = "NIXPACKS"
-buildCommand = "pip install -r requirements.txt"
+#
+# Using Dockerfile (auto-detected) — Nixpacks pulled the 4 GB CUDA build of
+# torch on Linux, which blew past Railway's image/memory limits. The
+# Dockerfile pins CPU-only torch and keeps the image ~1 GB.
 
 [deploy]
 startCommand = "uvicorn phase_9_api.main:app --host 0.0.0.0 --port $PORT"
