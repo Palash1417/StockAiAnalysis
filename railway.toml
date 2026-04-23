@@ -4,10 +4,14 @@
 # Using Dockerfile (auto-detected) — Nixpacks pulled the 4 GB CUDA build of
 # torch on Linux, which blew past Railway's image/memory limits. The
 # Dockerfile pins CPU-only torch and keeps the image ~1 GB.
+#
+# NOTE: startCommand intentionally omitted. The Dockerfile CMD already uses
+# `sh -c` to expand $PORT at runtime. Setting startCommand here caused
+# Railway to run `uvicorn ... --port $PORT` as argv without a shell, so the
+# literal string `$PORT` was passed to uvicorn and rejected as a non-integer.
 
 [deploy]
-startCommand = "uvicorn phase_9_api.main:app --host 0.0.0.0 --port $PORT"
 healthcheckPath = "/health"
-healthcheckTimeout = 100
+healthcheckTimeout = 180
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
