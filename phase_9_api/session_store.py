@@ -39,6 +39,9 @@ class SQLiteSessionStore:
         self._db_path = db_path
         self._ttl = ttl_seconds
         self._lock = threading.Lock()
+        if db_path != ":memory:":
+            from pathlib import Path
+            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._init_schema()
 
